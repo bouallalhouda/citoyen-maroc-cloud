@@ -1,0 +1,10 @@
+.env
+.git
+__pycache__/
+*.pyc
+.venv/
+venv/
+.pytest_cache/
+test_main.py
+sample_batch.json
+README.md
