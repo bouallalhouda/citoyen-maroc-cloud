@@ -1,0 +1,8 @@
+{
+  "name": "lambda-api-actualites",
+  "version": "1.0.0",
+  "type": "module",
+  "dependencies": {
+    "jose": "^5.9.6"
+  }
+}
