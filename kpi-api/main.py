@@ -10,7 +10,7 @@ Configuration par variables d'environnement :
   MONGODB_DB       nom de la base (defaut : citoyencloud_kpi)
   API_KEY          cle d'API d'ingestion partagee avec l'ETL (secret)
   ALLOWED_ORIGINS  origines CORS autorisees, separees par des virgules
-                   (adresse du site Azure App Service)
+                   (adresse du site Azure App Service ; defaut : site Azure + localhost)
 """
 
 import hmac
@@ -50,10 +50,13 @@ class Rankings(BaseModel):
     mena: Optional[Rank] = None
 
 
+Category = Literal["health", "education", "economy"]
+
+
 class Indicator(BaseModel):
     code: str = Field(min_length=1, max_length=64)  # ex. SP.DYN.LE00.IN
     name: str = Field(min_length=1, max_length=200)
-    category: Literal["health", "education"]
+    category: Category
     unit: Optional[str] = Field(default=None, max_length=32)
     year: int = Field(ge=1960, le=2100)
     value: float
@@ -67,10 +70,10 @@ class IngestBatch(BaseModel):
     indicators: list[Indicator] = Field(min_length=1, max_length=500)
 
     @model_validator(mode="after")
-    def unique_codes(self):
-        codes = [i.code for i in self.indicators]
-        if len(codes) != len(set(codes)):
-            raise ValueError("codes d'indicateurs dupliques dans le lot")
+    def unique_code_year(self):
+        keys = [(i.code, i.year) for i in self.indicators]
+        if len(keys) != len(set(keys)):
+            raise ValueError("couples (code, annee) dupliques dans le lot")
         return self
 
 
@@ -112,21 +115,26 @@ def require_api_key(x_api_key: Optional[str] = Header(default=None)) -> None:
 # --------------------------------------------------------------------------- #
 app = FastAPI(
     title="API KPI - CitoyenCloud Maroc",
-    description="Indicateurs de sante et d'education du Maroc et classements.",
-    version="1.0.0",
+    description="Indicateurs de sante, d'education et d'economie du Maroc et classements.",
+    version="1.2.0",
 )
 
+# Site Azure de Najia + tests locaux (surchargeable par ALLOWED_ORIGINS)
+DEFAULT_ORIGINS = (
+    "https://citoyencloud-maroc-hfcrexacd5djfdaa.italynorth-01.azurewebsites.net,"
+    "http://localhost:8080,http://localhost:3000"
+)
 origins = [
-    o.strip()
-    for o in os.getenv("ALLOWED_ORIGINS", "http://localhost:3000").split(",")
+    o.strip().rstrip("/")
+    for o in os.getenv("ALLOWED_ORIGINS", DEFAULT_ORIGINS).split(",")
     if o.strip()
 ]
 app.add_middleware(
     CORSMiddleware,
     allow_origins=origins,
     allow_credentials=False,
-    allow_methods=["GET", "POST"],
-    allow_headers=["X-API-Key", "Content-Type"],
+    allow_methods=["GET", "POST", "OPTIONS"],
+    allow_headers=["Authorization", "Content-Type", "X-API-Key"],
 )
 
 
@@ -156,13 +164,20 @@ def health():
     dependencies=[Depends(require_api_key)],
 )
 def ingest(batch: IngestBatch, db: Database = Depends(get_db)):
-    """Ingestion d'un lot valide par l'ETL. Idempotent : un indicateur est remplace par son code."""
+    """Ingestion d'un lot valide par l'ETL (une ligne par indicateur ET par annee).
+
+    Idempotent : un couple (code, annee) deja present est remplace.
+    """
     now = datetime.now(timezone.utc)
     inserted = 0
     for ind in batch.indicators:
         doc = ind.model_dump()
-        doc.update({"_id": ind.code, "batch_id": batch.batch_id, "updated_at": now})
-        res = db.indicators.replace_one({"_id": ind.code}, doc, upsert=True)
+        doc.update(
+            {"_id": f"{ind.code}:{ind.year}", "batch_id": batch.batch_id, "updated_at": now}
+        )
+        # Ancien format (cle = code seul, avant l'historique) : on le supprime
+        db.indicators.delete_one({"_id": ind.code})
+        res = db.indicators.replace_one({"_id": doc["_id"]}, doc, upsert=True)
         if res.upserted_id is not None:
             inserted += 1
 
@@ -187,16 +202,26 @@ def ingest(batch: IngestBatch, db: Database = Depends(get_db)):
     )
 
 
+def _latest_per_code(docs: list[dict]) -> list[dict]:
+    """Garde, pour chaque code, la ligne de l'annee la plus recente."""
+    latest: dict[str, dict] = {}
+    for d in docs:
+        if d["code"] not in latest or d["year"] > latest[d["code"]]["year"]:
+            latest[d["code"]] = d
+    return sorted(latest.values(), key=lambda d: (d["category"], d["code"]))
+
+
 @app.get("/kpi")
 def list_kpi(
-    category: Optional[Literal["health", "education"]] = Query(default=None),
+    category: Optional[Category] = Query(default=None),
     db: Database = Depends(get_db),
 ):
-    """Liste des indicateurs pour le dashboard (filtre optionnel par categorie)."""
+    """Derniere valeur de chaque indicateur (filtre optionnel par categorie).
+
+    L'historique complet est disponible par indicateur : GET /kpi/{code}/history.
+    """
     query = {"category": category} if category else {}
-    items = list(
-        db.indicators.find(query, {"_id": 0}).sort([("category", 1), ("code", 1)])
-    )
+    items = _latest_per_code(list(db.indicators.find(query, {"_id": 0})))
     last = db.batches.find_one(sort=[("received_at", -1)])
     return {
         "count": len(items),
@@ -215,10 +240,30 @@ def last_update(db: Database = Depends(get_db)):
     return last
 
 
+@app.get("/kpi/{code}/history")
+def get_kpi_history(code: str, db: Database = Depends(get_db)):
+    """Serie chronologique d'un indicateur (annees croissantes), pour les courbes."""
+    docs = list(db.indicators.find({"code": code}, {"_id": 0}).sort("year", 1))
+    if not docs:
+        raise HTTPException(status_code=404, detail="Indicateur introuvable")
+    last = docs[-1]
+    return {
+        "code": code,
+        "name": last["name"],
+        "category": last["category"],
+        "unit": last.get("unit"),
+        "count": len(docs),
+        "series": [
+            {"year": d["year"], "value": d["value"], "rankings": d.get("rankings")}
+            for d in docs
+        ],
+    }
+
+
 @app.get("/kpi/{code}")
 def get_kpi(code: str, db: Database = Depends(get_db)):
-    """Un indicateur par son code."""
-    doc = db.indicators.find_one({"_id": code}, {"_id": 0})
-    if not doc:
+    """Un indicateur par son code (annee la plus recente)."""
+    docs = list(db.indicators.find({"code": code}, {"_id": 0}))
+    if not docs:
         raise HTTPException(status_code=404, detail="Indicateur introuvable")
-    return doc
+    return max(docs, key=lambda d: d["year"])

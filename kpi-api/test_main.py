@@ -94,3 +94,104 @@ def test_unknown_category_rejected(client):
     bad = json.loads(json.dumps(SAMPLE))
     bad["indicators"][0]["category"] = "sport"
     assert client.post("/kpi/ingest", json=bad, headers=KEY).status_code == 422
+
+
+REAL = json.loads(
+    (Path(__file__).parent / "tests" / "lot_reel_2026-W48.json").read_text(encoding="utf-8")
+)
+AZURE = "https://citoyencloud-maroc-hfcrexacd5djfdaa.italynorth-01.azurewebsites.net"
+
+
+def test_real_batch_with_economy_accepted(client):
+    """Lot reel de Houda (10 indicateurs dont 3 'economy') : avant correction -> 422."""
+    r = client.post("/kpi/ingest", json=REAL, headers=KEY)
+    assert r.status_code == 200, r.text
+    assert r.json() == {"batch_id": "2026-W48", "received": 10, "inserted": 10, "updated": 0}
+    eco = client.get("/kpi", params={"category": "economy"}).json()
+    assert eco["count"] == 3
+    assert {i["code"] for i in eco["items"]} == {
+        "SL.UEM.TOTL.NE.ZS", "GGXWDG_NGDP", "GC.XPN.INTP.RV.ZS"
+    }
+    assert client.get("/kpi").json()["count"] == 10
+
+
+def test_cors_preflight_azure_site(client):
+    r = client.options(
+        "/kpi/ingest",
+        headers={
+            "Origin": AZURE,
+            "Access-Control-Request-Method": "POST",
+            "Access-Control-Request-Headers": "authorization,content-type",
+        },
+    )
+    assert r.status_code == 200
+    assert r.headers["access-control-allow-origin"] == AZURE
+
+
+def test_cors_get_localhost_8080(client):
+    r = client.get("/health", headers={"Origin": "http://localhost:8080"})
+    assert r.headers["access-control-allow-origin"] == "http://localhost:8080"
+
+
+def test_cors_unknown_origin_refused(client):
+    r = client.get("/health", headers={"Origin": "https://autre-site.example"})
+    assert "access-control-allow-origin" not in r.headers
+
+
+def _history_batch():
+    """Un indicateur sur 3 annees + un second sur 1 annee (format Houda : un objet par annee)."""
+    base = json.loads(json.dumps(REAL["indicators"][0]))
+    rows = []
+    for year, value in [(2022, 20.0), (2023, 21.5), (2024, 23.28)]:
+        row = json.loads(json.dumps(base))
+        row.update({"year": year, "value": value})
+        rows.append(row)
+    other = json.loads(json.dumps(REAL["indicators"][4]))
+    return {"batch_id": "2026-W49", "indicators": rows + [other]}
+
+
+def test_same_code_several_years_accepted(client):
+    r = client.post("/kpi/ingest", json=_history_batch(), headers=KEY)
+    assert r.status_code == 200, r.text
+    assert r.json()["received"] == 4 and r.json()["inserted"] == 4
+
+
+def test_same_code_same_year_rejected(client):
+    bad = _history_batch()
+    bad["indicators"].append(bad["indicators"][0])
+    assert client.post("/kpi/ingest", json=bad, headers=KEY).status_code == 422
+
+
+def test_history_endpoint_sorted(client):
+    client.post("/kpi/ingest", json=_history_batch(), headers=KEY)
+    r = client.get("/kpi/SE.XPD.TOTL.GB.ZS/history")
+    assert r.status_code == 200
+    body = r.json()
+    assert body["count"] == 3
+    assert [p["year"] for p in body["series"]] == [2022, 2023, 2024]
+    assert body["series"][-1]["value"] == 23.28
+    assert client.get("/kpi/INCONNU/history").status_code == 404
+
+
+def test_list_and_get_return_latest_year_only(client):
+    client.post("/kpi/ingest", json=_history_batch(), headers=KEY)
+    lst = client.get("/kpi").json()
+    assert lst["count"] == 2  # 2 indicateurs, pas 4 lignes
+    one = client.get("/kpi/SE.XPD.TOTL.GB.ZS").json()
+    assert one["year"] == 2024 and one["value"] == 23.28
+
+
+def test_history_reingest_idempotent(client):
+    client.post("/kpi/ingest", json=_history_batch(), headers=KEY)
+    r = client.post("/kpi/ingest", json=_history_batch(), headers=KEY)
+    assert r.json()["inserted"] == 0 and r.json()["updated"] == 4
+    assert client.get("/kpi/SE.XPD.TOTL.GB.ZS/history").json()["count"] == 3
+
+
+def test_legacy_document_replaced(client):
+    """Un document de l'ancien format (_id = code) ne doit pas doubler la ligne."""
+    db = main.app.dependency_overrides[main.get_db]()
+    legacy = dict(REAL["indicators"][0])
+    db.indicators.insert_one({**legacy, "_id": legacy["code"]})
+    client.post("/kpi/ingest", json=REAL, headers=KEY)
+    assert client.get("/kpi/SE.XPD.TOTL.GB.ZS/history").json()["count"] == 1
