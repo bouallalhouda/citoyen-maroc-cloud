@@ -155,6 +155,7 @@ def health():
         except Exception:  # noqa: BLE001
             log.exception("Ping MongoDB en echec")
             status["db"] = "unreachable"
+            status["db_error"] = type(exc).__name__
     return status
 
 
