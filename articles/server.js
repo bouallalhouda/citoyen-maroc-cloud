@@ -2,12 +2,18 @@
 const express = require("express");
 const cors = require("cors");
 const admin = require("firebase-admin");
+const { createRemoteJWKSet, jwtVerify } = require("jose");
 
-// Clé de compte de service Firebase, stockée en variable d'environnement Render (JSON complet)
-admin.initializeApp({
-  credential: admin.credential.cert(JSON.parse(process.env.FIREBASE_SERVICE_ACCOUNT)),
-});
+// Clé de compte de service Firebase (base Firestore), en variable d'environnement Render
+const serviceAccount = JSON.parse(process.env.FIREBASE_SERVICE_ACCOUNT);
+admin.initializeApp({ credential: admin.credential.cert(serviceAccount) });
 const db = admin.firestore();
+
+// Projet Firebase qui délivre les jetons des admins (celui du site, peut différer de celui de Firestore)
+const AUTH_PROJECT_ID = process.env.AUTH_FIREBASE_PROJECT_ID || serviceAccount.project_id;
+const JWKS = createRemoteJWKSet(
+  new URL("https://www.googleapis.com/service_accounts/v1/jwk/securetoken@system.gserviceaccount.com")
+);
 
 // Listes séparées par des virgules (variables d'environnement Render)
 const liste = (v) => (v || "").split(",").map((s) => s.trim()).filter(Boolean);
@@ -38,14 +44,19 @@ async function requireAdmin(req, res, next) {
   const token = header.startsWith("Bearer ") ? header.slice(7) : null;
   if (!token) return res.status(401).json({ error: "Jeton manquant" });
   try {
-    req.user = await admin.auth().verifyIdToken(token);
+    const { payload } = await jwtVerify(token, JWKS, {
+      issuer: `https://securetoken.google.com/${AUTH_PROJECT_ID}`,
+      audience: AUTH_PROJECT_ID,
+    });
+    req.user = payload;
   } catch (e) {
-    console.warn("Jeton invalide :", e.code);
+    console.warn("Jeton invalide :", e.code || e.message, "(projet attendu :", AUTH_PROJECT_ID + ")");
     return res.status(401).json({ error: "Jeton invalide" });
   }
   // Un jeton valide prouve seulement un compte Firebase : on vérifie aussi l'e-mail
   const email = (req.user.email || "").toLowerCase();
   if (ADMINS.length && !ADMINS.includes(email)) {
+    console.warn("E-mail non autorisé :", email);
     return res.status(403).json({ error: "Accès réservé à l'administrateur" });
   }
   next();
@@ -86,4 +97,6 @@ crud("articles", "articles");
 crud("partis", "partis");
 
 const port = process.env.PORT || 3000;
-app.listen(port, () => console.log(`API articles à l'écoute sur ${port}`));
+app.listen(port, () =>
+  console.log(`API articles à l'écoute sur ${port} (jetons du projet : ${AUTH_PROJECT_ID})`)
+);
